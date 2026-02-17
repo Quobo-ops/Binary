@@ -112,10 +112,10 @@ def template_folder(tmp_path: Path) -> Path:
 class TestMetadataGeneration:
     def test_generates_four_files(self, element_folder: Path):
         paths = generate_metadata(element_folder)
-        assert len(paths) == 4
+        assert len(paths) == 6
 
         filenames = {p.name for p in paths}
-        assert filenames == {"README.md", "COMPLIANCE.md", "COST.md", "USAGE.md"}
+        assert filenames == {"README.md", "COMPLIANCE.md", "COST.md", "USAGE.md", "VALIDATION.md", "SCHEDULE.md"}
 
     def test_all_files_exist(self, element_folder: Path):
         generate_metadata(element_folder)
@@ -333,7 +333,7 @@ class TestEdgeCases:
             "IFCClass": "IfcWall",
         }))
         paths = generate_metadata(folder)
-        assert len(paths) == 4
+        assert len(paths) == 6
 
     def test_empty_materials(self, tmp_path: Path):
         """Generation works with no materials."""
@@ -349,6 +349,6 @@ class TestEdgeCases:
         (mat_dir / "materials.json").write_text("[]")
 
         paths = generate_metadata(folder)
-        assert len(paths) == 4
+        assert len(paths) == 6
         readme = (folder / "README.md").read_text()
         assert "NoMat" in readme

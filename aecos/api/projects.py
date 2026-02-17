@@ -97,7 +97,7 @@ def extract_ifc(
 
     Returns the list of extracted :class:`Element` models.
     """
-    from aecos.extraction.pipeline import ifc_to_element_folders
+    from aecos.extraction import ifc_to_element_folders
 
     output_dir = project_root / "elements"
     elements = ifc_to_element_folders(ifc_path, output_dir)

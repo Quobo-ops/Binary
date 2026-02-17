@@ -520,7 +520,7 @@ class TestExtractIFC:
                 )
             return mock_elements
 
-        with patch("aecos.extraction.pipeline.ifc_to_element_folders", side_effect=mock_extract):
+        with patch("aecos.extraction.ifc_to_element_folders", side_effect=mock_extract):
             elements = os.extract_ifc("fake.ifc")
 
         assert len(elements) == 2
