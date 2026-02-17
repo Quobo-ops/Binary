@@ -1,8 +1,7 @@
-"""COMPLIANCE.md template — placeholder structure for compliance data.
+"""COMPLIANCE.md template — renders compliance data.
 
-Actual compliance logic is deferred to Item 07 (Code Compliance Engine).
-This module generates a structured placeholder that lists applicable Psets
-and notes that automated compliance checking is pending.
+When a ComplianceReport is available (Item 07), it is rendered inline.
+Otherwise, falls back to listing property sets with a pending-status note.
 """
 
 from __future__ import annotations
@@ -15,8 +14,21 @@ def render_compliance(
     psets: dict[str, dict[str, Any]],
     *,
     manifest: dict[str, Any] | None = None,
+    compliance_report: Any | None = None,
 ) -> str:
-    """Return the full Markdown string for ``COMPLIANCE.md``."""
+    """Return the full Markdown string for ``COMPLIANCE.md``.
+
+    Parameters
+    ----------
+    compliance_report:
+        An optional ``ComplianceReport`` instance.  When provided, its
+        ``to_markdown()`` output replaces the placeholder status section.
+    """
+    # If a full compliance report is available, render it directly
+    if compliance_report is not None and hasattr(compliance_report, "to_markdown"):
+        return compliance_report.to_markdown()
+
+    # Otherwise, render the structured placeholder
     name = metadata.get("Name") or metadata.get("GlobalId", "Unknown")
     ifc_class = metadata.get("IFCClass", "Unknown")
 
