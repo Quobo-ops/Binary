@@ -9,6 +9,8 @@ Usage::
     os.search(ifc_class="IfcWall", material="concrete")
     os.promote_to_template(element_id, tags={...})
     os.commit("Added new wall elements")
+    os.parse("2-hour fire-rated concrete wall, 12 feet tall")
+    os.check_compliance(element_or_spec)
 """
 
 from __future__ import annotations
@@ -22,7 +24,11 @@ from aecos.api import projects as proj_ops
 from aecos.api import search as search_ops
 from aecos.api import templates as tmpl_ops
 from aecos.api.search import SearchResults
+from aecos.compliance.engine import ComplianceEngine
+from aecos.compliance.report import ComplianceReport
 from aecos.models.element import Element
+from aecos.nlp.parser import NLParser
+from aecos.nlp.schema import ParametricSpec
 from aecos.templates.library import TemplateLibrary
 from aecos.templates.registry import RegistryEntry
 from aecos.templates.tagging import TemplateTags
@@ -68,6 +74,10 @@ class AecOS:
         # Initialise template library
         templates_dir = self.project_root / "templates"
         self.library = TemplateLibrary(templates_dir)
+
+        # Initialise NL parser and compliance engine (Items 06, 07)
+        self.parser = NLParser()
+        self.compliance = ComplianceEngine()
 
     # -- Element CRUD ---------------------------------------------------------
 
@@ -270,6 +280,44 @@ class AecOS:
             repo=self.repo if self.auto_commit else None,
             auto_commit=self.auto_commit,
         )
+
+    # -- Natural language parsing (Item 06) -----------------------------------
+
+    def parse(
+        self,
+        text: str,
+        context: dict[str, Any] | None = None,
+    ) -> ParametricSpec:
+        """Parse a plain-English building description into a ParametricSpec.
+
+        Parameters
+        ----------
+        text:
+            Natural-language building specification.
+        context:
+            Optional dict with ``project_type``, ``climate_zone``,
+            ``jurisdiction``, etc.
+        """
+        return self.parser.parse(text, context)
+
+    # -- Compliance checking (Item 07) ----------------------------------------
+
+    def check_compliance(
+        self,
+        element_or_spec: Any,
+        *,
+        region: str | None = None,
+    ) -> ComplianceReport:
+        """Check an element or spec against the compliance rule database.
+
+        Parameters
+        ----------
+        element_or_spec:
+            An ``Element`` or ``ParametricSpec``.
+        region:
+            Override region for rule filtering.
+        """
+        return self.compliance.check(element_or_spec, region=region)
 
     # -- Direct VCS access ----------------------------------------------------
 
