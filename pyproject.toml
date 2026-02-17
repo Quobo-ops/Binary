@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "aecos"
-version = "0.1.0"
+version = "0.3.0"
 description = "AEC OS — AI-assisted operating system for architecture, engineering, and construction"
 requires-python = ">=3.11"
 dependencies = [
