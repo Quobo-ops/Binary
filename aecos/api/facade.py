@@ -11,6 +11,9 @@ Usage::
     os.commit("Added new wall elements")
     os.parse("2-hour fire-rated concrete wall, 12 feet tall")
     os.check_compliance(element_or_spec)
+    os.generate("150mm concrete wall, 2hr fire rated, California")
+    os.validate(element_folder)
+    os.estimate_cost(element_folder)
 """
 
 from __future__ import annotations
@@ -26,12 +29,18 @@ from aecos.api import templates as tmpl_ops
 from aecos.api.search import SearchResults
 from aecos.compliance.engine import ComplianceEngine
 from aecos.compliance.report import ComplianceReport
+from aecos.cost.engine import CostEngine
+from aecos.cost.report import CostReport
+from aecos.generation.generator import ElementGenerator
+from aecos.metadata.generator import generate_metadata
 from aecos.models.element import Element
 from aecos.nlp.parser import NLParser
 from aecos.nlp.schema import ParametricSpec
 from aecos.templates.library import TemplateLibrary
 from aecos.templates.registry import RegistryEntry
 from aecos.templates.tagging import TemplateTags
+from aecos.validation.report import ValidationReport
+from aecos.validation.validator import Validator
 from aecos.vcs.commits import commit_all
 from aecos.vcs.repo import RepoManager
 
@@ -78,6 +87,14 @@ class AecOS:
         # Initialise NL parser and compliance engine (Items 06, 07)
         self.parser = NLParser()
         self.compliance = ComplianceEngine()
+
+        # Initialise generation, validation, and cost engines (Items 08, 09, 10)
+        self.generator = ElementGenerator(
+            self.project_root / "elements",
+            compliance_engine=self.compliance,
+        )
+        self.validator = Validator()
+        self.cost_engine = CostEngine()
 
     # -- Element CRUD ---------------------------------------------------------
 
@@ -318,6 +335,141 @@ class AecOS:
             Override region for rule filtering.
         """
         return self.compliance.check(element_or_spec, region=region)
+
+    # -- Parametric generation (Item 08) --------------------------------------
+
+    def generate(
+        self,
+        text_or_spec: str | ParametricSpec,
+        context: dict[str, Any] | None = None,
+    ) -> Path:
+        """Full pipeline: parse -> comply -> generate -> validate -> cost -> metadata -> commit.
+
+        Parameters
+        ----------
+        text_or_spec:
+            Natural-language text or a ParametricSpec.
+        context:
+            Optional parsing context.
+
+        Returns the path to the generated element folder.
+        """
+        # 1. Parse
+        if isinstance(text_or_spec, str):
+            spec = self.parser.parse(text_or_spec, context)
+        else:
+            spec = text_or_spec
+
+        # 2. Compliance
+        compliance_report = self.compliance.check(spec)
+
+        # 3. Generate
+        element_folder = self.generator.generate(spec)
+
+        # 4. Validate
+        validation_report = self.validator.validate(element_folder)
+
+        # 5. Cost
+        cost_report = self.cost_engine.estimate(element_folder)
+
+        # 6. Regenerate metadata with real report data
+        try:
+            generate_metadata(
+                element_folder,
+                compliance_report=compliance_report,
+                cost_report=cost_report,
+                validation_report=validation_report,
+            )
+        except Exception:
+            logger.debug("Metadata regeneration failed", exc_info=True)
+
+        # 7. Auto-commit
+        if self.auto_commit:
+            try:
+                commit_all(
+                    self.repo,
+                    message=f"feat: generate element {spec.ifc_class} ({element_folder.name})",
+                )
+            except Exception:
+                logger.debug("Auto-commit failed for generate", exc_info=True)
+
+        return element_folder
+
+    def generate_from_template(
+        self,
+        template_id: str,
+        overrides: dict[str, Any] | None = None,
+    ) -> Path:
+        """Generate an element from a template with overrides.
+
+        Same pipeline as :meth:`generate` but starts from a template base.
+        """
+        template_folder = self.library.get_template(template_id)
+        if template_folder is None:
+            raise FileNotFoundError(f"Template not found: {template_id}")
+
+        element_folder = self.generator.generate_from_template(template_folder, overrides)
+
+        # Run validation and cost
+        validation_report = self.validator.validate(element_folder)
+        cost_report = self.cost_engine.estimate(element_folder)
+
+        try:
+            generate_metadata(
+                element_folder,
+                cost_report=cost_report,
+                validation_report=validation_report,
+            )
+        except Exception:
+            logger.debug("Metadata regeneration failed", exc_info=True)
+
+        if self.auto_commit:
+            try:
+                commit_all(
+                    self.repo,
+                    message=f"feat: generate from template {template_id} ({element_folder.name})",
+                )
+            except Exception:
+                logger.debug("Auto-commit failed for generate_from_template", exc_info=True)
+
+        return element_folder
+
+    # -- Validation (Item 09) -------------------------------------------------
+
+    def validate(
+        self,
+        element_folder: str | Path,
+        context: list[str | Path] | None = None,
+    ) -> ValidationReport:
+        """Validate an element folder.
+
+        Parameters
+        ----------
+        element_folder:
+            Path to the element folder.
+        context:
+            Optional list of context element folder paths for clash detection.
+        """
+        return self.validator.validate(element_folder, context_elements=context)
+
+    # -- Cost estimation (Item 10) --------------------------------------------
+
+    def estimate_cost(
+        self,
+        element_folder_or_spec: Any,
+        *,
+        region: str | None = None,
+    ) -> CostReport:
+        """Estimate cost and schedule for an element.
+
+        Parameters
+        ----------
+        element_folder_or_spec:
+            Path to element folder, or a ParametricSpec.
+        region:
+            Override region code.
+        """
+        return self.cost_engine.estimate(element_folder_or_spec, region=region)
 
     # -- Direct VCS access ----------------------------------------------------
 
