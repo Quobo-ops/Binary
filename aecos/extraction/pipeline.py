@@ -19,6 +19,7 @@ from aecos.extraction.geometry import extract_geometry, write_geometry
 from aecos.extraction.materials import extract_materials, write_materials
 from aecos.extraction.properties import extract_psets, flatten_psets, write_psets
 from aecos.extraction.relationships import extract_spatial, write_spatial
+from aecos.metadata.generator import generate_metadata
 from aecos.models.element import Element
 
 logger = logging.getLogger(__name__)
@@ -118,6 +119,14 @@ def _process_element(
     write_psets(psets, folder)
     write_materials(materials, folder)
     write_spatial(spatial, folder)
+
+    # Auto-generate Markdown metadata (Item 03 integration)
+    try:
+        generate_metadata(folder)
+    except Exception:
+        logger.debug(
+            "Metadata generation failed for %s", gid, exc_info=True
+        )
 
     return elem
 
