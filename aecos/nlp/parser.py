@@ -12,13 +12,16 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from aecos.nlp.providers.base import LLMProvider
 from aecos.nlp.providers.fallback import FallbackProvider
 from aecos.nlp.providers.ollama import OllamaProvider
 from aecos.nlp.resolution import apply_context, compute_confidence, detect_ambiguities
 from aecos.nlp.schema import ParametricSpec
+
+if TYPE_CHECKING:
+    from aecos.finetune.collector import InteractionCollector
 
 logger = logging.getLogger(__name__)
 
@@ -51,10 +54,19 @@ class NLParser:
         An explicit :class:`LLMProvider` to use.  If *None*, the parser
         tries :class:`OllamaProvider` then falls back to
         :class:`FallbackProvider`.
+    collector:
+        Optional :class:`InteractionCollector` for fine-tuning data
+        collection.  When set, every ``parse()`` call auto-logs the
+        interaction.
     """
 
-    def __init__(self, provider: LLMProvider | None = None) -> None:
+    def __init__(
+        self,
+        provider: LLMProvider | None = None,
+        collector: InteractionCollector | None = None,
+    ) -> None:
         self._fallback = FallbackProvider()
+        self._collector = collector
         if provider is not None:
             self._provider = provider
         else:
@@ -86,11 +98,34 @@ class NLParser:
         # Try LLM provider first
         spec = self._try_llm(text, context)
         if spec is not None:
+            self._log_interaction(text, context, spec)
             return spec
 
         # Fall back to rule-based engine
         logger.debug("Using fallback regex engine for: %s", text[:80])
-        return self._fallback.parse(text, context)
+        spec = self._fallback.parse(text, context)
+        self._log_interaction(text, context, spec)
+        return spec
+
+    def _log_interaction(
+        self,
+        text: str,
+        context: dict[str, Any] | None,
+        spec: ParametricSpec,
+    ) -> None:
+        """Auto-log the interaction if a collector is configured."""
+        if self._collector is None:
+            return
+        try:
+            self._collector.log_interaction(
+                prompt=text,
+                context=context,
+                raw_output=None,
+                parsed_spec=spec.model_dump() if hasattr(spec, "model_dump") else spec.__dict__,
+                confidence=spec.confidence,
+            )
+        except Exception:
+            logger.debug("Failed to log interaction for fine-tuning", exc_info=True)
 
     def _try_llm(
         self, text: str, context: dict[str, Any] | None,
