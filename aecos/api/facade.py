@@ -21,15 +21,26 @@ Usage::
     os.submit_regulatory_update("IBC2024", new_rules)
     os.add_comment(element_id, user, text)
     os.execute_command("add a concrete wall", user="alice")
+    os.get_audit_log()
+    os.verify_audit_chain()
+    os.scan_security(project_path)
+    os.get_kpis()
+    os.generate_dashboard()
 """
 
 from __future__ import annotations
 
 import logging
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from aecos.analytics.collector import MetricsCollector
+from aecos.analytics.dashboard import DashboardGenerator
+from aecos.analytics.exporter import ReportExporter
+from aecos.analytics.kpi import KPICalculator
+from aecos.analytics.warehouse import DataWarehouse
 from aecos.api import elements as elem_ops
 from aecos.api import projects as proj_ops
 from aecos.api import search as search_ops
@@ -42,6 +53,13 @@ from aecos.compliance.report import ComplianceReport
 from aecos.compliance.rules import Rule
 from aecos.cost.engine import CostEngine
 from aecos.cost.report import CostReport
+from aecos.deployment.ci import CIGenerator
+from aecos.deployment.config_manager import ConfigManager
+from aecos.deployment.docker import DockerBuilder
+from aecos.deployment.health import HealthChecker, HealthReport
+from aecos.deployment.installer import Installer
+from aecos.deployment.packager import SystemPackager
+from aecos.deployment.rollback import RollbackManager
 from aecos.domains.base import DomainPlugin
 from aecos.domains.registry import DomainRegistry
 from aecos.finetune.collector import InteractionCollector
@@ -58,6 +76,11 @@ from aecos.regulatory.impact import ImpactAnalyzer
 from aecos.regulatory.monitor import UpdateCheckResult, UpdateMonitor
 from aecos.regulatory.report import UpdateReport
 from aecos.regulatory.updater import RuleUpdater
+from aecos.security.audit import AuditEntry, AuditLogger
+from aecos.security.encryption import EncryptionManager
+from aecos.security.hasher import Hasher
+from aecos.security.report import SecurityReport
+from aecos.security.scanner import SecurityScanner
 from aecos.sync.locking import LockInfo
 from aecos.sync.manager import SyncManager
 from aecos.templates.library import TemplateLibrary
@@ -70,6 +93,15 @@ from aecos.vcs.repo import RepoManager
 from aecos.visualization.bridge import ExportResult, VisualizationBridge
 
 logger = logging.getLogger(__name__)
+
+
+def _safe_dump(obj: Any) -> str:
+    """Serialize an object to string for hashing, regardless of type."""
+    if hasattr(obj, "model_dump"):
+        return str(obj.model_dump())
+    if hasattr(obj, "to_dict"):
+        return str(obj.to_dict())
+    return str(obj)
 
 
 class AecOS:
@@ -158,6 +190,58 @@ class AecOS:
             self.project_root,
             aecos_facade=self,
         )
+
+        # Security & Audit (Item 17)
+        self.audit_logger = AuditLogger(":memory:")
+        self.hasher = Hasher()
+        self.encryption = EncryptionManager(self.project_root)
+        self.security_scanner = SecurityScanner(audit_logger=self.audit_logger)
+
+        # Analytics (Item 19)
+        self.metrics = MetricsCollector(":memory:")
+        self._warehouse = DataWarehouse(self.metrics._conn)
+        self._kpi = KPICalculator(self._warehouse)
+        self._dashboard_gen = DashboardGenerator(self._kpi, self._warehouse)
+        self._report_exporter = ReportExporter()
+
+        # Deployment (Item 18)
+        self._packager = SystemPackager()
+        self._installer = Installer()
+        self._health_checker = HealthChecker()
+        self._config_manager = ConfigManager()
+        self._docker_builder = DockerBuilder()
+        self._ci_generator = CIGenerator()
+        self._rollback_manager = RollbackManager(self.project_root)
+
+    # -- Internal audit/metrics helpers ---------------------------------------
+
+    def _audit(
+        self,
+        user: str,
+        action: str,
+        resource: str = "",
+        before_hash: str | None = None,
+        after_hash: str | None = None,
+    ) -> None:
+        """Log an audit event (best-effort)."""
+        try:
+            self.audit_logger.log(user, action, resource, before_hash, after_hash)
+        except Exception:
+            logger.debug("Audit logging failed", exc_info=True)
+
+    def _record_metric(
+        self,
+        module: str,
+        event_type: str,
+        value: float | None = None,
+        metadata: dict[str, Any] | None = None,
+        user: str = "",
+    ) -> None:
+        """Record a metrics event (best-effort)."""
+        try:
+            self.metrics.record(module, event_type, value, metadata, user)
+        except Exception:
+            logger.debug("Metrics recording failed", exc_info=True)
 
     # -- Element CRUD ---------------------------------------------------------
 
@@ -252,7 +336,12 @@ class AecOS:
         Returns the path to the new template folder.
         """
         element_folder = self.project_root / "elements" / f"element_{element_id}"
-        return tmpl_ops.promote_to_template(
+
+        before = ""
+        if element_folder.is_dir():
+            before = self.hasher.hash_folder(element_folder)
+
+        result = tmpl_ops.promote_to_template(
             self.library,
             element_folder,
             repo=self.repo if self.auto_commit else None,
@@ -262,6 +351,12 @@ class AecOS:
             description=description,
             auto_commit=self.auto_commit,
         )
+
+        after = self.hasher.hash_folder(result) if result.is_dir() else ""
+        self._audit("system", "template_add", str(result), before, after)
+        self._record_metric("template", "reuse_count", 1.0, {"template_id": element_id})
+
+        return result
 
     def add_template(
         self,
@@ -274,7 +369,7 @@ class AecOS:
         description: str = "",
     ) -> Path:
         """Add a template to the library."""
-        return tmpl_ops.add_template(
+        result = tmpl_ops.add_template(
             self.library,
             template_id,
             source_folder,
@@ -286,14 +381,21 @@ class AecOS:
             auto_commit=self.auto_commit,
         )
 
+        after = self.hasher.hash_folder(result) if result.is_dir() else ""
+        self._audit("system", "template_add", template_id, "", after)
+
+        return result
+
     def remove_template(self, template_id: str) -> bool:
         """Remove a template from the library."""
-        return tmpl_ops.remove_template(
+        result = tmpl_ops.remove_template(
             self.library,
             template_id,
             repo=self.repo if self.auto_commit else None,
             auto_commit=self.auto_commit,
         )
+        self._audit("system", "template_remove", template_id)
+        return result
 
     def search_templates(self, query: dict[str, object]) -> list[RegistryEntry]:
         """Search the template library."""
@@ -338,12 +440,18 @@ class AecOS:
 
         Returns the list of extracted :class:`Element` models.
         """
-        return proj_ops.extract_ifc(
+        result = proj_ops.extract_ifc(
             self.project_root,
             ifc_path,
             repo=self.repo if self.auto_commit else None,
             auto_commit=self.auto_commit,
         )
+        self._record_metric(
+            "extraction", "elements_extracted",
+            float(len(result)),
+            {"ifc_path": str(ifc_path)},
+        )
+        return result
 
     def bulk_promote(
         self,
@@ -368,17 +476,17 @@ class AecOS:
         text: str,
         context: dict[str, Any] | None = None,
     ) -> ParametricSpec:
-        """Parse a plain-English building description into a ParametricSpec.
+        """Parse a plain-English building description into a ParametricSpec."""
+        prompt_hash = self.hasher.hash_string(text)
+        spec = self.parser.parse(text, context)
+        result_hash = self.hasher.hash_string(_safe_dump(spec))
 
-        Parameters
-        ----------
-        text:
-            Natural-language building specification.
-        context:
-            Optional dict with ``project_type``, ``climate_zone``,
-            ``jurisdiction``, etc.
-        """
-        return self.parser.parse(text, context)
+        self._audit("system", "parse", text[:100], prompt_hash, result_hash)
+
+        confidence = getattr(spec, "confidence", 0.9)
+        self._record_metric("parser", "parse_completed", confidence)
+
+        return spec
 
     # -- Compliance checking (Item 07) ----------------------------------------
 
@@ -388,16 +496,17 @@ class AecOS:
         *,
         region: str | None = None,
     ) -> ComplianceReport:
-        """Check an element or spec against the compliance rule database.
+        """Check an element or spec against the compliance rule database."""
+        element_hash = self.hasher.hash_string(str(element_or_spec))
+        report = self.compliance.check(element_or_spec, region=region)
+        report_hash = self.hasher.hash_string(_safe_dump(report))
 
-        Parameters
-        ----------
-        element_or_spec:
-            An ``Element`` or ``ParametricSpec``.
-        region:
-            Override region for rule filtering.
-        """
-        return self.compliance.check(element_or_spec, region=region)
+        self._audit("system", "compliance_check", "", element_hash, report_hash)
+
+        passed = 1.0 if report.status == "compliant" else 0.0
+        self._record_metric("compliance", "check_completed", passed)
+
+        return report
 
     # -- Parametric generation (Item 08) --------------------------------------
 
@@ -408,32 +517,29 @@ class AecOS:
     ) -> Path:
         """Full pipeline: parse -> comply -> generate -> validate -> cost -> visualize -> metadata -> commit.
 
-        Parameters
-        ----------
-        text_or_spec:
-            Natural-language text or a ParametricSpec.
-        context:
-            Optional parsing context.
-
         Returns the path to the generated element folder.
         """
+        t0 = time.time()
+
         # 1. Parse
         if isinstance(text_or_spec, str):
-            spec = self.parser.parse(text_or_spec, context)
+            spec = self.parse(text_or_spec, context)
         else:
             spec = text_or_spec
 
+        spec_hash = self.hasher.hash_string(_safe_dump(spec))
+
         # 2. Compliance
-        compliance_report = self.compliance.check(spec)
+        compliance_report = self.check_compliance(spec)
 
         # 3. Generate
         element_folder = self.generator.generate(spec)
 
         # 4. Validate
-        validation_report = self.validator.validate(element_folder)
+        validation_report = self.validate(element_folder)
 
         # 5. Cost
-        cost_report = self.cost_engine.estimate(element_folder)
+        cost_report = self.estimate_cost(element_folder)
 
         # 6. Visualize (Item 11)
         try:
@@ -462,6 +568,12 @@ class AecOS:
             except Exception:
                 logger.debug("Auto-commit failed for generate", exc_info=True)
 
+        folder_hash = self.hasher.hash_folder(element_folder) if element_folder.is_dir() else ""
+        self._audit("system", "generate", str(element_folder), spec_hash, folder_hash)
+
+        duration_ms = (time.time() - t0) * 1000
+        self._record_metric("generation", "element_generated", duration_ms)
+
         return element_folder
 
     def generate_from_template(
@@ -469,13 +581,12 @@ class AecOS:
         template_id: str,
         overrides: dict[str, Any] | None = None,
     ) -> Path:
-        """Generate an element from a template with overrides.
-
-        Same pipeline as :meth:`generate` but starts from a template base.
-        """
+        """Generate an element from a template with overrides."""
         template_folder = self.library.get_template(template_id)
         if template_folder is None:
             raise FileNotFoundError(f"Template not found: {template_id}")
+
+        t0 = time.time()
 
         element_folder = self.generator.generate_from_template(template_folder, overrides)
 
@@ -501,6 +612,10 @@ class AecOS:
             except Exception:
                 logger.debug("Auto-commit failed for generate_from_template", exc_info=True)
 
+        duration_ms = (time.time() - t0) * 1000
+        self._record_metric("generation", "element_generated", duration_ms, {"template_id": template_id})
+        self._record_metric("template", "reuse_count", 1.0, {"template_id": template_id})
+
         return element_folder
 
     # -- Validation (Item 09) -------------------------------------------------
@@ -510,16 +625,18 @@ class AecOS:
         element_folder: str | Path,
         context: list[str | Path] | None = None,
     ) -> ValidationReport:
-        """Validate an element folder.
+        """Validate an element folder."""
+        folder = Path(element_folder)
+        folder_hash = self.hasher.hash_folder(folder) if folder.is_dir() else ""
 
-        Parameters
-        ----------
-        element_folder:
-            Path to the element folder.
-        context:
-            Optional list of context element folder paths for clash detection.
-        """
-        return self.validator.validate(element_folder, context_elements=context)
+        report = self.validator.validate(element_folder, context_elements=context)
+        report_hash = self.hasher.hash_string(_safe_dump(report))
+
+        self._audit("system", "validate", str(folder), folder_hash, report_hash)
+        status_val = 1.0 if report.status == "valid" else 0.0
+        self._record_metric("validation", "validation_completed", status_val)
+
+        return report
 
     # -- Cost estimation (Item 10) --------------------------------------------
 
@@ -529,16 +646,17 @@ class AecOS:
         *,
         region: str | None = None,
     ) -> CostReport:
-        """Estimate cost and schedule for an element.
+        """Estimate cost and schedule for an element."""
+        element_hash = self.hasher.hash_string(str(element_folder_or_spec))
+        report = self.cost_engine.estimate(element_folder_or_spec, region=region)
+        report_hash = self.hasher.hash_string(_safe_dump(report))
 
-        Parameters
-        ----------
-        element_folder_or_spec:
-            Path to element folder, or a ParametricSpec.
-        region:
-            Override region code.
-        """
-        return self.cost_engine.estimate(element_folder_or_spec, region=region)
+        self._audit("system", "cost_estimate", "", element_hash, report_hash)
+
+        total = getattr(report, "total_cost", 0.0) or 0.0
+        self._record_metric("cost", "estimate_completed", float(total))
+
+        return report
 
     # -- Visualization (Item 11) ----------------------------------------------
 
@@ -547,22 +665,11 @@ class AecOS:
         element_folder: str | Path,
         format: str = "json3d",
     ) -> ExportResult:
-        """Export an element to a 3D visualization format.
-
-        Parameters
-        ----------
-        element_folder:
-            Path to the element folder.
-        format:
-            Export format: ``json3d``, ``obj``, ``gltf``, or ``speckle``.
-        """
+        """Export an element to a 3D visualization format."""
         return self.viz.export(element_folder, format=format)
 
     def generate_viewer(self, element_folder: str | Path) -> Path:
-        """Generate an interactive HTML viewer for an element.
-
-        Returns the path to the HTML file.
-        """
+        """Generate an interactive HTML viewer for an element."""
         return self.viz.generate_viewer(element_folder)
 
     # -- Multi-user sync (Item 12) --------------------------------------------
@@ -574,7 +681,9 @@ class AecOS:
     ) -> Any:
         """Fetch remote, detect conflicts, auto-merge if safe."""
         mgr = SyncManager(self.project_root, user_id, role)
-        return mgr.sync()
+        result = mgr.sync()
+        self._audit(user_id, "sync_pull", "")
+        return result
 
     def push_changes(
         self,
@@ -584,7 +693,9 @@ class AecOS:
     ) -> str:
         """Commit and push with conflict check."""
         mgr = SyncManager(self.project_root, user_id, role)
-        return mgr.push_changes(message)
+        result = mgr.push_changes(message)
+        self._audit(user_id, "sync_push", message)
+        return result
 
     def pull_latest(
         self,
@@ -623,18 +734,17 @@ class AecOS:
         *,
         correction: dict[str, Any] | None = None,
     ) -> bool:
-        """Record feedback on a parser interaction.
-
-        If *correction* is provided, marks as corrected.
-        Otherwise, marks as approved.
-        """
+        """Record feedback on a parser interaction."""
         if correction is not None:
             return self._feedback.record_correction(interaction_id, correction)
         return self._feedback.record_approval(interaction_id)
 
     def evaluate_parser(self) -> EvaluationReport:
         """Evaluate the current NLP parser against the golden test set."""
-        return self._evaluator.evaluate(self.parser._fallback)
+        report = self._evaluator.evaluate(self.parser._fallback)
+        accuracy = getattr(report, "accuracy", 0.0) or 0.0
+        self._record_metric("finetune", "evaluation_completed", float(accuracy))
+        return report
 
     def build_training_dataset(self) -> Path:
         """Build a training dataset from collected interactions."""
@@ -643,10 +753,7 @@ class AecOS:
     # -- Domain expansion (Item 14) -------------------------------------------
 
     def list_domains(self) -> list[dict[str, Any]]:
-        """List all registered domains.
-
-        Returns a list of dicts with domain info.
-        """
+        """List all registered domains."""
         return [
             {
                 "name": d.name,
@@ -674,10 +781,7 @@ class AecOS:
     # -- Regulatory auto-update (Item 15) -------------------------------------
 
     def check_regulatory_updates(self) -> list[UpdateCheckResult]:
-        """Check all regulatory sources for updates.
-
-        Returns a list of check results.
-        """
+        """Check all regulatory sources for updates."""
         return self._update_monitor.check_all()
 
     def submit_regulatory_update(
@@ -687,43 +791,26 @@ class AecOS:
         *,
         new_version: str = "",
     ) -> UpdateReport:
-        """Submit a manual regulatory update.
-
-        This is the primary update path (no scraping required).
-
-        Parameters
-        ----------
-        code_name:
-            Code identifier (e.g. 'IBC2024').
-        new_rules:
-            List of Rule-compatible dicts with updated rules.
-        new_version:
-            Optional new version string.
-        """
+        """Submit a manual regulatory update."""
         # Convert dicts to Rule objects
         parsed_rules = [Rule(**r) for r in new_rules]
 
-        # Get current rules for this code
         old_rules = self.compliance.get_rules(code_name=code_name)
-
-        # Get current version
         source = self._update_monitor.get_source(code_name)
         old_version = source.current_version if source else ""
 
-        # Diff
         diff = self._rule_differ.diff_rules(old_rules, parsed_rules)
 
-        # Apply atomically
+        before_hash = self.hasher.hash_string(str([_safe_dump(r) for r in old_rules]))
+
         update_result = self._rule_updater.apply_update(
             diff, code_name=code_name, version=new_version,
         )
 
-        # Impact analysis
         impact = self._impact_analyzer.analyze(
             diff, library_path=self.library.root,
         )
 
-        # Build report
         report = UpdateReport(
             code_name=code_name,
             old_version=old_version,
@@ -737,18 +824,18 @@ class AecOS:
             git_tag=update_result.git_tag,
         )
 
-        # Write report
         report_path = self.project_root / "REGULATORY_UPDATE.md"
         report_path.write_text(report.to_markdown(), encoding="utf-8")
 
-        # Log activity
         self.collaboration.activity.record_event(ActivityEvent(
             type="regulatory_update",
             summary=f"Regulatory update: {code_name} {new_version}",
             details={"code_name": code_name, "changes": diff.summary()},
         ))
 
-        # Auto-commit
+        after_hash = self.hasher.hash_string(str([_safe_dump(r) for r in parsed_rules]))
+        self._audit("system", "regulatory_update", code_name, before_hash, after_hash)
+
         if self.auto_commit:
             try:
                 commit_all(
@@ -770,7 +857,10 @@ class AecOS:
         reply_to: str | None = None,
     ) -> Comment:
         """Add a comment to an element."""
-        return self.collaboration.add_comment(element_id, user, text, reply_to)
+        comment = self.collaboration.add_comment(element_id, user, text, reply_to)
+        self._audit(user, "collab_comment", element_id)
+        self._record_metric("collaboration", "comment_added", 1.0, user=user)
+        return comment
 
     def get_comments(self, element_id: str) -> list[Comment]:
         """Get all comments for an element."""
@@ -785,7 +875,9 @@ class AecOS:
         priority: str = "normal",
     ) -> Task:
         """Create a collaboration task."""
-        return self.collaboration.create_task(title, assignee, element_id, due_date, priority)
+        task = self.collaboration.create_task(title, assignee, element_id, due_date, priority)
+        self._audit(assignee, "collab_task_create", element_id)
+        return task
 
     def get_tasks(
         self,
@@ -803,7 +895,9 @@ class AecOS:
         notes: str | None = None,
     ) -> Review:
         """Request a review for an element."""
-        return self.collaboration.request_review(element_id, reviewer, notes)
+        review = self.collaboration.request_review(element_id, reviewer, notes)
+        self._audit(reviewer, "collab_review_request", element_id)
+        return review
 
     def approve_review(
         self,
@@ -812,7 +906,11 @@ class AecOS:
         comments: str | None = None,
     ) -> Review | None:
         """Approve a review."""
-        return self.collaboration.approve_review(review_id, reviewer, comments)
+        review = self.collaboration.approve_review(review_id, reviewer, comments)
+        if review:
+            self._audit(reviewer, "collab_review_approve", review.element_id)
+            self._record_metric("collaboration", "review_approved", 1.0, user=reviewer)
+        return review
 
     def reject_review(
         self,
@@ -821,7 +919,10 @@ class AecOS:
         reason: str,
     ) -> Review | None:
         """Reject a review with reason."""
-        return self.collaboration.reject_review(review_id, reviewer, reason)
+        review = self.collaboration.reject_review(review_id, reviewer, reason)
+        if review:
+            self._audit(reviewer, "collab_review_reject", review.element_id)
+        return review
 
     def get_activity_feed(
         self,
@@ -832,20 +933,117 @@ class AecOS:
         return self.collaboration.get_activity_feed(since=since, limit=limit)
 
     def execute_command(self, text: str, user: str = "") -> str:
-        """Execute a natural-language command via the bot provider.
-
-        Parses the text, executes the appropriate action, and returns
-        a formatted response.
-        """
+        """Execute a natural-language command via the bot provider."""
         return self.collaboration.execute_command(text, user=user)
+
+    # -- Security & Audit (Item 17) -------------------------------------------
+
+    def get_audit_log(
+        self,
+        resource: str | None = None,
+        user: str | None = None,
+        since: str | None = None,
+    ) -> list[AuditEntry]:
+        """Query the audit log."""
+        return self.audit_logger.get_log(resource=resource, user=user, since=since)
+
+    def verify_audit_chain(self) -> bool:
+        """Validate the entire audit hash chain."""
+        return self.audit_logger.verify_chain()
+
+    def scan_security(self, project_path: str | Path | None = None) -> SecurityReport:
+        """Run a full security scan."""
+        path = Path(project_path) if project_path else self.project_root
+        report = self.security_scanner.scan_all(path)
+        report_hash = self.hasher.hash_string(report.to_json())
+        self._audit("system", "security_scan", str(path), "", report_hash)
+        self._record_metric(
+            "security", "scan_completed",
+            float(len(report.findings)),
+        )
+        return report
+
+    def encrypt_element(self, element_id: str, key: bytes) -> list[Path]:
+        """Encrypt an element folder."""
+        folder = self.project_root / "elements" / f"element_{element_id}"
+        return self.encryption.encrypt_folder(folder, key, patterns=[".json", ".ifc"])
+
+    def decrypt_element(self, element_id: str, key: bytes) -> list[Path]:
+        """Decrypt an element folder."""
+        folder = self.project_root / "elements" / f"element_{element_id}"
+        decrypted: list[Path] = []
+        for f in folder.rglob("*"):
+            if f.is_file() and f.suffix in (".json", ".ifc"):
+                self.encryption.decrypt_file(f, key)
+                decrypted.append(f)
+        return decrypted
+
+    # -- Deployment (Item 18) -------------------------------------------------
+
+    def package_system(self, output_path: str | Path) -> Path:
+        """Package the AEC OS project for distribution."""
+        return self._packager.package(self.project_root, output_path)
+
+    def check_health(self) -> HealthReport:
+        """Run health checks on the installation."""
+        return self._health_checker.check(self.project_root)
+
+    def create_snapshot(self, label: str) -> dict[str, Any]:
+        """Create a rollback snapshot."""
+        return self._rollback_manager.create_snapshot(label)
+
+    def rollback(self, label: str) -> bool:
+        """Rollback to a snapshot."""
+        return self._rollback_manager.rollback(label)
+
+    def list_snapshots(self) -> list[dict[str, Any]]:
+        """List available rollback snapshots."""
+        return self._rollback_manager.list_snapshots()
+
+    def generate_dockerfile(self) -> Path:
+        """Generate a Dockerfile for the project."""
+        return self._docker_builder.generate_dockerfile(self.project_root)
+
+    def generate_ci_config(self) -> Path:
+        """Generate GitHub Actions CI workflow."""
+        return self._ci_generator.generate_github_actions(self.project_root)
+
+    # -- Analytics (Item 19) --------------------------------------------------
+
+    def get_metrics(
+        self,
+        module: str,
+        event_type: str,
+        period: str = "month",
+    ) -> list[tuple[str, float]]:
+        """Get aggregated metric data."""
+        return self._warehouse.aggregate(module, event_type, period)
+
+    def get_kpis(self) -> dict[str, Any]:
+        """Get all KPIs from Bible Section 8."""
+        return self._kpi.all_kpis()
+
+    def generate_dashboard(self) -> Path:
+        """Generate an HTML analytics dashboard."""
+        return self._dashboard_gen.generate_html(self.project_root)
+
+    def export_analytics(self, format: str = "json") -> str:
+        """Export analytics in the given format."""
+        kpis = self._kpi.all_kpis()
+        if format == "csv":
+            events = self.metrics.get_events()
+            path = self.project_root / "ANALYTICS.csv"
+            self._report_exporter.export_csv(events, path)
+            return str(path)
+        elif format == "markdown":
+            return self._report_exporter.export_markdown(kpis)
+        else:
+            return self._report_exporter.export_json(kpis)
 
     # -- Direct VCS access ----------------------------------------------------
 
     def commit(self, message: str) -> str:
-        """Create a manual commit of all pending changes.
-
-        Returns the short commit hash, or empty string if clean.
-        """
+        """Create a manual commit of all pending changes."""
         return commit_all(self.repo, message)
 
     def status(self) -> str:
