@@ -17,11 +17,16 @@ Usage::
     os.export_visualization(element_folder, format="json3d")
     os.sync()
     os.evaluate_parser()
+    os.list_domains()
+    os.submit_regulatory_update("IBC2024", new_rules)
+    os.add_comment(element_id, user, text)
+    os.execute_command("add a concrete wall", user="alice")
 """
 
 from __future__ import annotations
 
 import logging
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -30,10 +35,15 @@ from aecos.api import projects as proj_ops
 from aecos.api import search as search_ops
 from aecos.api import templates as tmpl_ops
 from aecos.api.search import SearchResults
+from aecos.collaboration.manager import CollaborationManager
+from aecos.collaboration.models import ActivityEvent, Comment, Review, Task
 from aecos.compliance.engine import ComplianceEngine
 from aecos.compliance.report import ComplianceReport
+from aecos.compliance.rules import Rule
 from aecos.cost.engine import CostEngine
 from aecos.cost.report import CostReport
+from aecos.domains.base import DomainPlugin
+from aecos.domains.registry import DomainRegistry
 from aecos.finetune.collector import InteractionCollector
 from aecos.finetune.dataset import DatasetBuilder
 from aecos.finetune.evaluator import EvaluationReport, ModelEvaluator
@@ -43,6 +53,11 @@ from aecos.metadata.generator import generate_metadata
 from aecos.models.element import Element
 from aecos.nlp.parser import NLParser
 from aecos.nlp.schema import ParametricSpec
+from aecos.regulatory.differ import RuleDiffer
+from aecos.regulatory.impact import ImpactAnalyzer
+from aecos.regulatory.monitor import UpdateCheckResult, UpdateMonitor
+from aecos.regulatory.report import UpdateReport
+from aecos.regulatory.updater import RuleUpdater
 from aecos.sync.locking import LockInfo
 from aecos.sync.manager import SyncManager
 from aecos.templates.library import TemplateLibrary
@@ -121,6 +136,28 @@ class AecOS:
             self.project_root / "fine_tuning" / "datasets",
         )
         self._evaluator = ModelEvaluator()
+
+        # Domain expansion (Item 14) — auto-discover and inject
+        self.domain_registry = DomainRegistry()
+        self.domain_registry.auto_discover()
+        self.domain_registry.apply_all(
+            compliance_engine=self.compliance,
+            parser=self.parser,
+            cost_engine=self.cost_engine,
+            validator=self.validator,
+        )
+
+        # Regulatory auto-update (Item 15)
+        self._update_monitor = UpdateMonitor()
+        self._rule_differ = RuleDiffer()
+        self._rule_updater = RuleUpdater(self.compliance, self.project_root)
+        self._impact_analyzer = ImpactAnalyzer(self.project_root)
+
+        # Collaboration layer (Item 16)
+        self.collaboration = CollaborationManager(
+            self.project_root,
+            aecos_facade=self,
+        )
 
     # -- Element CRUD ---------------------------------------------------------
 
@@ -602,6 +639,205 @@ class AecOS:
     def build_training_dataset(self) -> Path:
         """Build a training dataset from collected interactions."""
         return self._dataset_builder.build_dataset()
+
+    # -- Domain expansion (Item 14) -------------------------------------------
+
+    def list_domains(self) -> list[dict[str, Any]]:
+        """List all registered domains.
+
+        Returns a list of dicts with domain info.
+        """
+        return [
+            {
+                "name": d.name,
+                "description": d.description,
+                "ifc_classes": d.ifc_classes,
+            }
+            for d in self.domain_registry.list_domains()
+        ]
+
+    def get_domain_info(self, name: str) -> dict[str, Any] | None:
+        """Get detailed info about a specific domain."""
+        domain = self.domain_registry.get_domain(name)
+        if domain is None:
+            return None
+        return {
+            "name": domain.name,
+            "description": domain.description,
+            "ifc_classes": domain.ifc_classes,
+            "template_count": len(domain.register_templates()),
+            "rule_count": len(domain.register_compliance_rules()),
+            "parser_pattern_count": len(domain.register_parser_patterns()),
+            "cost_entry_count": len(domain.register_cost_data()),
+        }
+
+    # -- Regulatory auto-update (Item 15) -------------------------------------
+
+    def check_regulatory_updates(self) -> list[UpdateCheckResult]:
+        """Check all regulatory sources for updates.
+
+        Returns a list of check results.
+        """
+        return self._update_monitor.check_all()
+
+    def submit_regulatory_update(
+        self,
+        code_name: str,
+        new_rules: list[dict[str, Any]],
+        *,
+        new_version: str = "",
+    ) -> UpdateReport:
+        """Submit a manual regulatory update.
+
+        This is the primary update path (no scraping required).
+
+        Parameters
+        ----------
+        code_name:
+            Code identifier (e.g. 'IBC2024').
+        new_rules:
+            List of Rule-compatible dicts with updated rules.
+        new_version:
+            Optional new version string.
+        """
+        # Convert dicts to Rule objects
+        parsed_rules = [Rule(**r) for r in new_rules]
+
+        # Get current rules for this code
+        old_rules = self.compliance.get_rules(code_name=code_name)
+
+        # Get current version
+        source = self._update_monitor.get_source(code_name)
+        old_version = source.current_version if source else ""
+
+        # Diff
+        diff = self._rule_differ.diff_rules(old_rules, parsed_rules)
+
+        # Apply atomically
+        update_result = self._rule_updater.apply_update(
+            diff, code_name=code_name, version=new_version,
+        )
+
+        # Impact analysis
+        impact = self._impact_analyzer.analyze(
+            diff, library_path=self.library.root,
+        )
+
+        # Build report
+        report = UpdateReport(
+            code_name=code_name,
+            old_version=old_version,
+            new_version=new_version,
+            changes_summary=diff.summary(),
+            rules_added=update_result.rules_added,
+            rules_modified=update_result.rules_modified,
+            rules_removed=update_result.rules_removed,
+            affected_templates_count=len(impact.affected_templates),
+            affected_elements_count=len(impact.affected_elements),
+            git_tag=update_result.git_tag,
+        )
+
+        # Write report
+        report_path = self.project_root / "REGULATORY_UPDATE.md"
+        report_path.write_text(report.to_markdown(), encoding="utf-8")
+
+        # Log activity
+        self.collaboration.activity.record_event(ActivityEvent(
+            type="regulatory_update",
+            summary=f"Regulatory update: {code_name} {new_version}",
+            details={"code_name": code_name, "changes": diff.summary()},
+        ))
+
+        # Auto-commit
+        if self.auto_commit:
+            try:
+                commit_all(
+                    self.repo,
+                    message=f"regulatory: update {code_name} to {new_version}",
+                )
+            except Exception:
+                logger.debug("Auto-commit failed for regulatory update", exc_info=True)
+
+        return report
+
+    # -- Collaboration (Item 16) ----------------------------------------------
+
+    def add_comment(
+        self,
+        element_id: str,
+        user: str,
+        text: str,
+        reply_to: str | None = None,
+    ) -> Comment:
+        """Add a comment to an element."""
+        return self.collaboration.add_comment(element_id, user, text, reply_to)
+
+    def get_comments(self, element_id: str) -> list[Comment]:
+        """Get all comments for an element."""
+        return self.collaboration.get_comments(element_id)
+
+    def create_task(
+        self,
+        title: str,
+        assignee: str,
+        element_id: str = "",
+        due_date: datetime | None = None,
+        priority: str = "normal",
+    ) -> Task:
+        """Create a collaboration task."""
+        return self.collaboration.create_task(title, assignee, element_id, due_date, priority)
+
+    def get_tasks(
+        self,
+        assignee: str | None = None,
+        status: str | None = None,
+        element_id: str | None = None,
+    ) -> list[Task]:
+        """Get tasks with optional filtering."""
+        return self.collaboration.get_tasks(assignee, status, element_id)
+
+    def request_review(
+        self,
+        element_id: str,
+        reviewer: str,
+        notes: str | None = None,
+    ) -> Review:
+        """Request a review for an element."""
+        return self.collaboration.request_review(element_id, reviewer, notes)
+
+    def approve_review(
+        self,
+        review_id: str,
+        reviewer: str,
+        comments: str | None = None,
+    ) -> Review | None:
+        """Approve a review."""
+        return self.collaboration.approve_review(review_id, reviewer, comments)
+
+    def reject_review(
+        self,
+        review_id: str,
+        reviewer: str,
+        reason: str,
+    ) -> Review | None:
+        """Reject a review with reason."""
+        return self.collaboration.reject_review(review_id, reviewer, reason)
+
+    def get_activity_feed(
+        self,
+        since: datetime | None = None,
+        limit: int = 50,
+    ) -> list[ActivityEvent]:
+        """Get the activity feed."""
+        return self.collaboration.get_activity_feed(since=since, limit=limit)
+
+    def execute_command(self, text: str, user: str = "") -> str:
+        """Execute a natural-language command via the bot provider.
+
+        Parses the text, executes the appropriate action, and returns
+        a formatted response.
+        """
+        return self.collaboration.execute_command(text, user=user)
 
     # -- Direct VCS access ----------------------------------------------------
 
