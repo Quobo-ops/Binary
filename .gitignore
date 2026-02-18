@@ -5,3 +5,8 @@ __pycache__/
 dist/
 build/
 .pytest_cache/
+audit.db
+analytics.db
+.env
+.aecos/keystore.json
+*.key
