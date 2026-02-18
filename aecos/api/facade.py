@@ -14,6 +14,9 @@ Usage::
     os.generate("150mm concrete wall, 2hr fire rated, California")
     os.validate(element_folder)
     os.estimate_cost(element_folder)
+    os.export_visualization(element_folder, format="json3d")
+    os.sync()
+    os.evaluate_parser()
 """
 
 from __future__ import annotations
@@ -31,11 +34,17 @@ from aecos.compliance.engine import ComplianceEngine
 from aecos.compliance.report import ComplianceReport
 from aecos.cost.engine import CostEngine
 from aecos.cost.report import CostReport
+from aecos.finetune.collector import InteractionCollector
+from aecos.finetune.dataset import DatasetBuilder
+from aecos.finetune.evaluator import EvaluationReport, ModelEvaluator
+from aecos.finetune.feedback import FeedbackManager
 from aecos.generation.generator import ElementGenerator
 from aecos.metadata.generator import generate_metadata
 from aecos.models.element import Element
 from aecos.nlp.parser import NLParser
 from aecos.nlp.schema import ParametricSpec
+from aecos.sync.locking import LockInfo
+from aecos.sync.manager import SyncManager
 from aecos.templates.library import TemplateLibrary
 from aecos.templates.registry import RegistryEntry
 from aecos.templates.tagging import TemplateTags
@@ -43,6 +52,7 @@ from aecos.validation.report import ValidationReport
 from aecos.validation.validator import Validator
 from aecos.vcs.commits import commit_all
 from aecos.vcs.repo import RepoManager
+from aecos.visualization.bridge import ExportResult, VisualizationBridge
 
 logger = logging.getLogger(__name__)
 
@@ -84,8 +94,13 @@ class AecOS:
         templates_dir = self.project_root / "templates"
         self.library = TemplateLibrary(templates_dir)
 
-        # Initialise NL parser and compliance engine (Items 06, 07)
-        self.parser = NLParser()
+        # Initialise fine-tuning collector (Item 13)
+        self._collector = InteractionCollector(
+            self.project_root / "fine_tuning" / "interactions",
+        )
+
+        # Initialise NL parser with collector (Items 06, 13)
+        self.parser = NLParser(collector=self._collector)
         self.compliance = ComplianceEngine()
 
         # Initialise generation, validation, and cost engines (Items 08, 09, 10)
@@ -95,6 +110,17 @@ class AecOS:
         )
         self.validator = Validator()
         self.cost_engine = CostEngine()
+
+        # Initialise visualization bridge (Item 11)
+        self.viz = VisualizationBridge()
+
+        # Fine-tuning subsystems (Item 13)
+        self._feedback = FeedbackManager(self._collector)
+        self._dataset_builder = DatasetBuilder(
+            self._collector,
+            self.project_root / "fine_tuning" / "datasets",
+        )
+        self._evaluator = ModelEvaluator()
 
     # -- Element CRUD ---------------------------------------------------------
 
@@ -343,7 +369,7 @@ class AecOS:
         text_or_spec: str | ParametricSpec,
         context: dict[str, Any] | None = None,
     ) -> Path:
-        """Full pipeline: parse -> comply -> generate -> validate -> cost -> metadata -> commit.
+        """Full pipeline: parse -> comply -> generate -> validate -> cost -> visualize -> metadata -> commit.
 
         Parameters
         ----------
@@ -372,7 +398,13 @@ class AecOS:
         # 5. Cost
         cost_report = self.cost_engine.estimate(element_folder)
 
-        # 6. Regenerate metadata with real report data
+        # 6. Visualize (Item 11)
+        try:
+            self.viz.export(element_folder, format="json3d")
+        except Exception:
+            logger.debug("Visualization export failed", exc_info=True)
+
+        # 7. Regenerate metadata with real report data
         try:
             generate_metadata(
                 element_folder,
@@ -383,7 +415,7 @@ class AecOS:
         except Exception:
             logger.debug("Metadata regeneration failed", exc_info=True)
 
-        # 7. Auto-commit
+        # 8. Auto-commit
         if self.auto_commit:
             try:
                 commit_all(
@@ -470,6 +502,106 @@ class AecOS:
             Override region code.
         """
         return self.cost_engine.estimate(element_folder_or_spec, region=region)
+
+    # -- Visualization (Item 11) ----------------------------------------------
+
+    def export_visualization(
+        self,
+        element_folder: str | Path,
+        format: str = "json3d",
+    ) -> ExportResult:
+        """Export an element to a 3D visualization format.
+
+        Parameters
+        ----------
+        element_folder:
+            Path to the element folder.
+        format:
+            Export format: ``json3d``, ``obj``, ``gltf``, or ``speckle``.
+        """
+        return self.viz.export(element_folder, format=format)
+
+    def generate_viewer(self, element_folder: str | Path) -> Path:
+        """Generate an interactive HTML viewer for an element.
+
+        Returns the path to the HTML file.
+        """
+        return self.viz.generate_viewer(element_folder)
+
+    # -- Multi-user sync (Item 12) --------------------------------------------
+
+    def sync(
+        self,
+        user_id: str = "default",
+        role: str = "designer",
+    ) -> Any:
+        """Fetch remote, detect conflicts, auto-merge if safe."""
+        mgr = SyncManager(self.project_root, user_id, role)
+        return mgr.sync()
+
+    def push_changes(
+        self,
+        message: str,
+        user_id: str = "default",
+        role: str = "designer",
+    ) -> str:
+        """Commit and push with conflict check."""
+        mgr = SyncManager(self.project_root, user_id, role)
+        return mgr.push_changes(message)
+
+    def pull_latest(
+        self,
+        user_id: str = "default",
+        role: str = "designer",
+    ) -> Any:
+        """Pull latest changes with auto-merge strategy."""
+        mgr = SyncManager(self.project_root, user_id, role)
+        return mgr.pull_latest()
+
+    def lock_element(
+        self,
+        element_id: str,
+        user_id: str = "default",
+        role: str = "designer",
+    ) -> LockInfo:
+        """Lock an element for exclusive editing."""
+        mgr = SyncManager(self.project_root, user_id, role)
+        return mgr.lock_element(element_id)
+
+    def unlock_element(
+        self,
+        element_id: str,
+        user_id: str = "default",
+        role: str = "designer",
+    ) -> bool:
+        """Unlock an element."""
+        mgr = SyncManager(self.project_root, user_id, role)
+        return mgr.unlock_element(element_id)
+
+    # -- Fine-tuning (Item 13) ------------------------------------------------
+
+    def record_feedback(
+        self,
+        interaction_id: str,
+        *,
+        correction: dict[str, Any] | None = None,
+    ) -> bool:
+        """Record feedback on a parser interaction.
+
+        If *correction* is provided, marks as corrected.
+        Otherwise, marks as approved.
+        """
+        if correction is not None:
+            return self._feedback.record_correction(interaction_id, correction)
+        return self._feedback.record_approval(interaction_id)
+
+    def evaluate_parser(self) -> EvaluationReport:
+        """Evaluate the current NLP parser against the golden test set."""
+        return self._evaluator.evaluate(self.parser._fallback)
+
+    def build_training_dataset(self) -> Path:
+        """Build a training dataset from collected interactions."""
+        return self._dataset_builder.build_dataset()
 
     # -- Direct VCS access ----------------------------------------------------
 
