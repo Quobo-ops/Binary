@@ -88,6 +88,8 @@ class NLParser:
         ParametricSpec
             Structured specification with all extracted parameters.
         """
+        if not isinstance(text, str):
+            text = str(text) if text is not None else ""
         text = text.strip()
         if not text:
             return ParametricSpec(

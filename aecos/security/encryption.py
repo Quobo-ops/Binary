@@ -42,6 +42,8 @@ class XORProvider(EncryptionProvider):
     """Minimal XOR cipher.  **Not secure** — for testing/demo only."""
 
     def encrypt(self, data: bytes, key: bytes) -> bytes:
+        if not key:
+            raise ValueError("Encryption key must not be empty")
         return bytes(d ^ key[i % len(key)] for i, d in enumerate(data))
 
     def decrypt(self, data: bytes, key: bytes) -> bytes:
