@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -38,7 +39,8 @@ class MetricsCollector:
 
     def __init__(self, db_path: str | Path = ":memory:") -> None:
         self._db_path = str(db_path)
-        self._conn = sqlite3.connect(self._db_path)
+        self._conn = sqlite3.connect(self._db_path, check_same_thread=False)
+        self._lock = threading.Lock()
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.executescript(_SCHEMA)
         self._conn.commit()
@@ -58,12 +60,13 @@ class MetricsCollector:
         ts = datetime.now(timezone.utc).isoformat()
         meta_json = json.dumps(metadata or {})
 
-        cur = self._conn.execute(
-            "INSERT INTO events (timestamp, module, event_type, value, metadata_json, user) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (ts, module, event_type, value, meta_json, user),
-        )
-        self._conn.commit()
+        with self._lock:
+            cur = self._conn.execute(
+                "INSERT INTO events (timestamp, module, event_type, value, metadata_json, user) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (ts, module, event_type, value, meta_json, user),
+            )
+            self._conn.commit()
         return cur.lastrowid or 0
 
     def get_events(

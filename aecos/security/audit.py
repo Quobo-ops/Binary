@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -55,7 +56,8 @@ class AuditLogger:
 
     def __init__(self, db_path: str | Path = ":memory:") -> None:
         self._db_path = str(db_path)
-        self._conn = sqlite3.connect(self._db_path)
+        self._conn = sqlite3.connect(self._db_path, check_same_thread=False)
+        self._lock = threading.Lock()
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.executescript(_SCHEMA)
         self._conn.commit()
@@ -77,19 +79,20 @@ class AuditLogger:
         bh = before_hash or ""
         ah = after_hash or ""
 
-        prev = self._last_hash()
+        with self._lock:
+            prev = self._last_hash()
 
-        entry_hash = Hasher.hash_string(
-            f"{ts}{user}{action}{resource}{bh}{ah}{prev}"
-        )
+            entry_hash = Hasher.hash_string(
+                f"{ts}{user}{action}{resource}{bh}{ah}{prev}"
+            )
 
-        cur = self._conn.execute(
-            "INSERT INTO audit_log "
-            "(timestamp, user, action, resource, before_hash, after_hash, "
-            "entry_hash, prev_entry_hash) VALUES (?,?,?,?,?,?,?,?)",
-            (ts, user, action, resource, bh, ah, entry_hash, prev),
-        )
-        self._conn.commit()
+            cur = self._conn.execute(
+                "INSERT INTO audit_log "
+                "(timestamp, user, action, resource, before_hash, after_hash, "
+                "entry_hash, prev_entry_hash) VALUES (?,?,?,?,?,?,?,?)",
+                (ts, user, action, resource, bh, ah, entry_hash, prev),
+            )
+            self._conn.commit()
 
         return AuditEntry(
             id=cur.lastrowid or 0,

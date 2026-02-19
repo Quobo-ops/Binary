@@ -59,13 +59,15 @@ class LockManager:
         Lock timeout in seconds.
     """
 
+    MIN_LOCK_TIMEOUT = 1  # Minimum 1 second to prevent instant-expiry bugs
+
     def __init__(
         self,
         project_root: str | Path,
         timeout: float = DEFAULT_LOCK_TIMEOUT,
     ) -> None:
         self.project_root = Path(project_root)
-        self.timeout = timeout
+        self.timeout = max(timeout, self.MIN_LOCK_TIMEOUT)
 
     def lock_element(
         self,
