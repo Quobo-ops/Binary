@@ -19,13 +19,19 @@ class ValidationReport:
         status: str = "passed",
         issues: list[ValidationIssue] | None = None,
         clash_results: list[Any] | None = None,
+        validated_at: datetime | str | None = None,
     ) -> None:
         self.element_id = element_id
         self.ifc_class = ifc_class
         self.status = status
         self.issues = issues or []
         self.clash_results = clash_results or []
-        self.validated_at = datetime.now(timezone.utc)
+        if validated_at is None:
+            self.validated_at = datetime.now(timezone.utc)
+        elif isinstance(validated_at, str):
+            self.validated_at = datetime.fromisoformat(validated_at)
+        else:
+            self.validated_at = validated_at
 
     def to_markdown(self) -> str:
         """Generate VALIDATION.md content."""
